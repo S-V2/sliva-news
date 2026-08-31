@@ -17,6 +17,29 @@ npm ci
 npm run dev
 ```
 
+Buka [http://localhost:3000](http://localhost:3000) di browser. Untuk menguji
+mode production secara lokal, cukup jalankan command berikut. Build production
+akan dibuat otomatis sebelum server menyala:
+
+```bash
+npm start
+```
+
+## Deployment Vercel
+
+Repository ini menggunakan Next.js native tanpa Vinext, Wrangler, Cloudflare
+Worker, atau Docker. Hubungkan repository ke Vercel dan gunakan pengaturan
+bawaan berikut:
+
+- Framework Preset: `Next.js`
+- Install Command: `npm ci`
+- Build Command: `npm run build`
+- Output Directory: kosongkan (otomatis dari Next.js)
+- Node.js Version: `22.x`
+
+Setiap push ke branch `main` akan menjadi production deployment jika Git
+Integration Vercel sudah aktif.
+
 ## Quality gate
 
 ```bash
