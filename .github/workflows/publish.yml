@@ -1,0 +1,203 @@
+name: Publish Sliva News image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-sliva-news-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/s-v2/sliva-news
+
+jobs:
+  verify:
+    name: Verify (lint, test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  publish:
+    name: Build, smoke and push sliva-news
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (load, do not push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max' || '' }}
+          provenance: false
+
+      - name: Report image size
+        run: |
+          set -euo pipefail
+          BYTES="$(docker image inspect "${IMAGE}:${GITHUB_SHA}" --format '{{.Size}}')"
+          echo "uncompressed size: ${BYTES} bytes ($((BYTES / 1048576)) MB)" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Boot smoke test
+        run: |
+          set -euo pipefail
+
+          IMAGE_REF="${IMAGE}:${GITHUB_SHA}"
+
+          MARKER_JSON="$(node -e '
+            const fs = require("node:fs");
+            const src = fs.readFileSync("tests/rendered-html.test.mjs", "utf8");
+            const m = src.match(/assert\.match\(\s*html\s*,\s*\/((?:[^\/\\\n]|\\.)+)\/([gimsuy]*)\s*\)/);
+            if (!m) {
+              console.error("could not source expected marker from tests/rendered-html.test.mjs");
+              process.exit(1);
+            }
+            process.stdout.write(JSON.stringify({ pattern: m[1], flags: m[2] }));
+          ')"
+          echo "expected marker: ${MARKER_JSON}"
+
+          cleanup() {
+            echo "--- container logs ---"
+            docker logs smoke 2>&1 || true
+            echo "--- container state ---"
+            docker inspect -f 'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' smoke 2>&1 || true
+            docker rm -f smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name smoke -p 127.0.0.1:3000:3000 "$IMAGE_REF"
+
+          ok=0
+          for _ in $(seq 1 30); do
+            if [ -z "$(docker ps -q --filter name=^smoke$ --filter status=running)" ]; then
+              echo "::error::container exited before serving a request"
+              exit 1
+            fi
+            code="$(curl -sS -o /tmp/smoke.html -D /tmp/smoke.head -w '%{http_code}' \
+                      -m 10 http://127.0.0.1:3000/ 2>/dev/null || true)"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 2
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::GET / never returned 200 within 60s (last code: ${code:-none})"
+            exit 1
+          fi
+
+          if ! grep -iqE '^content-type:[[:space:]]*text/html' /tmp/smoke.head; then
+            echo "::error::GET / did not return text/html"
+            cat /tmp/smoke.head
+            exit 1
+          fi
+
+          SMOKE_MARKER="$MARKER_JSON" node -e '
+            const fs = require("node:fs");
+            const { pattern, flags } = JSON.parse(process.env.SMOKE_MARKER);
+            const re = new RegExp(pattern, flags);
+            const html = fs.readFileSync("/tmp/smoke.html", "utf8");
+            if (!re.test(html)) {
+              console.error("::error::rendered HTML did not match /" + pattern + "/" + flags);
+              console.error(html.slice(0, 2000));
+              process.exit(1);
+            }
+            console.log("rendered HTML matched /" + pattern + "/" + flags);
+          '
+
+          echo "boot smoke test passed" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE}:${GITHUB_SHA}"
+          docker push "${IMAGE}:latest"
+          DIGEST="$(docker image inspect "${IMAGE}:${GITHUB_SHA}" \
+                     --format '{{index .RepoDigests 0}}')"
+          echo "pushed ${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+          SHA_DIGEST="@${DIGEST#*@}"
+          echo "digest=${SHA_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Repin NEWS_REF in the VM .env to ${SHA_DIGEST}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to VM
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Deploy to production VM
+        env:
+          SSH_HOST: ${{ secrets.VM_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM_SSH_USER }}
+          SSH_KEY: ${{ secrets.VM_SSH_KEY }}
+          NEWS_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SSH_HOST:-}" ] || [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::VM_SSH_HOST or VM_SSH_KEY secret is not set"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          SSH_CMD="ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o BatchMode=yes ${SSH_USER:-ubuntu}@${SSH_HOST}"
+
+          echo "Deploying sliva-news (${NEWS_DIGEST}) to ${SSH_HOST}..."
+          $SSH_CMD bash <<EOF
+            set -euo pipefail
+            cd /opt/slivadoc
+
+            # 1. Update pin in .env
+            sed -i.bak -E "s|^NEWS_REF=.*|NEWS_REF=${NEWS_DIGEST}|" .env
+
+            # 2. Pull updated image and recreate container
+            docker compose pull sliva-news
+            docker compose up -d --force-recreate sliva-news
+
+            # 3. Verify running container matches .env specification
+            ./scripts/verify-pins.sh
+          EOF
+          echo "Deployment successful."
