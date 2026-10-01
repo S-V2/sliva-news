@@ -4,7 +4,9 @@ import { expect, test, type Page } from "@playwright/test";
 // Serious/critical axe findings present on main when this gate landed, as
 // "<page> <rule> <element>". Anything else fails the run, and so does an entry
 // that no longer occurs: delete it when the markup is fixed.
-import knownViolations from "./known-a11y-violations.json" with { type: "json" };
+import knownViolationsJson from "./known-a11y-violations.json" with { type: "json" };
+
+const knownViolations: string[] = knownViolationsJson;
 
 async function open(page: Page, path: string) {
   const errors: string[] = [];
@@ -12,6 +14,11 @@ async function open(page: Page, path: string) {
     if (message.type() === "error") errors.push(message.text());
   });
   page.on("pageerror", (error) => errors.push(error.message));
+  // Story photos are hotlinked from images.unsplash.com through Next's image
+  // optimizer; a placeholder keeps an Unsplash hiccup from failing CI.
+  await page.route((url) => url.pathname === "/_next/image", (route) =>
+    route.fulfill({ contentType: "image/svg+xml", body: '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>' }),
+  );
   const response = await page.goto(path, { waitUntil: "networkidle" });
   expect(response?.status()).toBe(200);
   return errors;
