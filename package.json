@@ -11,7 +11,8 @@
     "prestart": "npm run build",
     "start": "next start -H 0.0.0.0",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "next": "16.3.6",
@@ -19,6 +20,8 @@
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
