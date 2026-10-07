@@ -19,7 +19,7 @@ env:
 
 jobs:
   verify:
-    name: Verify (lint, test)
+    name: Verify (lint, typecheck, test)
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
@@ -30,6 +30,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
+      - run: npm run typecheck
       - run: npm test
 
   publish:
